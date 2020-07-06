@@ -7,13 +7,13 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bsm/redislock"
-	"github.com/go-redis/redis/v7"
+	"github.com/creker/redislock-radix"
+	"github.com/mediocregopher/radix/v3"
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
 )
 
-const lockKey = "__bsm_redislock_unit_test__"
+const lockKey = "__creker_redislock-radix_unit_test__"
 
 var _ = Describe("Client", func() {
 	var subject *redislock.Client
@@ -23,7 +23,7 @@ var _ = Describe("Client", func() {
 	})
 
 	AfterEach(func() {
-		Expect(redisClient.Del(lockKey).Err()).To(Succeed())
+		Expect(redisClient.Do(radix.FlatCmd(nil, "DEL", lockKey))).To(Succeed())
 	})
 
 	It("should obtain once with TTL", func() {
@@ -76,7 +76,7 @@ var _ = Describe("Client", func() {
 		lock, err := redislock.Obtain(redisClient, lockKey, time.Minute, nil)
 		Expect(err).NotTo(HaveOccurred())
 
-		Expect(redisClient.Set(lockKey, "ABCD", 0).Err()).NotTo(HaveOccurred())
+		Expect(redisClient.Do(radix.FlatCmd(nil, "SET", lockKey, "ABCD"))).NotTo(HaveOccurred())
 		Expect(lock.Release()).To(MatchError(redislock.ErrLockNotHeld))
 	})
 
@@ -89,8 +89,8 @@ var _ = Describe("Client", func() {
 
 	It("should retry if enabled", func() {
 		// retry, succeed
-		Expect(redisClient.Set(lockKey, "ABCD", 0).Err()).NotTo(HaveOccurred())
-		Expect(redisClient.PExpire(lockKey, 20*time.Millisecond).Err()).NotTo(HaveOccurred())
+		Expect(redisClient.Do(radix.FlatCmd(nil, "SET", lockKey, "ABCD"))).NotTo(HaveOccurred())
+		Expect(redisClient.Do(radix.FlatCmd(nil, "PEXPIRE", lockKey, (20 * time.Millisecond).Milliseconds()))).NotTo(HaveOccurred())
 
 		lock, err := redislock.Obtain(redisClient, lockKey, time.Hour, &redislock.Options{
 			RetryStrategy: redislock.LimitRetry(redislock.LinearBackoff(100*time.Millisecond), 3),
@@ -99,15 +99,15 @@ var _ = Describe("Client", func() {
 		Expect(lock.Release()).To(Succeed())
 
 		// no retry, fail
-		Expect(redisClient.Set(lockKey, "ABCD", 0).Err()).NotTo(HaveOccurred())
-		Expect(redisClient.PExpire(lockKey, 50*time.Millisecond).Err()).NotTo(HaveOccurred())
+		Expect(redisClient.Do(radix.FlatCmd(nil, "SET", lockKey, "ABCD"))).NotTo(HaveOccurred())
+		Expect(redisClient.Do(radix.FlatCmd(nil, "PEXPIRE", lockKey, (50 * time.Millisecond).Milliseconds()))).NotTo(HaveOccurred())
 
 		_, err = redislock.Obtain(redisClient, lockKey, time.Hour, nil)
 		Expect(err).To(MatchError(redislock.ErrNotObtained))
 
 		// retry 2x, give up & fail
-		Expect(redisClient.Set(lockKey, "ABCD", 0).Err()).NotTo(HaveOccurred())
-		Expect(redisClient.PExpire(lockKey, 50*time.Millisecond).Err()).NotTo(HaveOccurred())
+		Expect(redisClient.Do(radix.FlatCmd(nil, "SET", lockKey, "ABCD"))).NotTo(HaveOccurred())
+		Expect(redisClient.Do(radix.FlatCmd(nil, "PEXPIRE", lockKey, (50 * time.Millisecond).Milliseconds()))).NotTo(HaveOccurred())
 
 		_, err = redislock.Obtain(redisClient, lockKey, time.Hour, &redislock.Options{
 			RetryStrategy: redislock.LimitRetry(redislock.LinearBackoff(time.Millisecond), 2),
@@ -183,14 +183,13 @@ func TestSuite(t *testing.T) {
 	RunSpecs(t, "redislock")
 }
 
-var redisClient *redis.Client
+var redisClient radix.Client
 
 var _ = BeforeSuite(func() {
-	redisClient = redis.NewClient(&redis.Options{
-		Network: "tcp",
-		Addr:    "127.0.0.1:6379", DB: 9,
-	})
-	Expect(redisClient.Ping().Err()).To(Succeed())
+	var err error
+	redisClient, err = radix.NewPool("tcp", "127.0.0.1:6379", 10)
+	Expect(err).NotTo(HaveOccurred())
+	Expect(redisClient.Do(radix.Cmd(nil, "PING", ""))).To(Succeed())
 })
 
 var _ = AfterSuite(func() {

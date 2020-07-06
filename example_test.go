@@ -5,16 +5,16 @@ import (
 	"log"
 	"time"
 
-	"github.com/bsm/redislock"
-	"github.com/go-redis/redis/v7"
+	"github.com/creker/redislock-radix"
+	"github.com/mediocregopher/radix/v3"
 )
 
 func Example() {
 	// Connect to redis.
-	client := redis.NewClient(&redis.Options{
-		Network: "tcp",
-		Addr:    "127.0.0.1:6379",
-	})
+	client, err := radix.NewPool("tcp", "127.0.0.1:6379", 10)
+	if err != nil {
+		log.Fatalln(err)
+	}
 	defer client.Close()
 
 	// Create a new lock client.

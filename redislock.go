@@ -10,13 +10,13 @@ import (
 	"sync"
 	"time"
 
-	"github.com/go-redis/redis/v7"
+	"github.com/mediocregopher/radix/v3"
 )
 
 var (
-	luaRefresh = redis.NewScript(`if redis.call("get", KEYS[1]) == ARGV[1] then return redis.call("pexpire", KEYS[1], ARGV[2]) else return 0 end`)
-	luaRelease = redis.NewScript(`if redis.call("get", KEYS[1]) == ARGV[1] then return redis.call("del", KEYS[1]) else return 0 end`)
-	luaPTTL    = redis.NewScript(`if redis.call("get", KEYS[1]) == ARGV[1] then return redis.call("pttl", KEYS[1]) else return -3 end`)
+	luaRefresh = radix.NewEvalScript(1, `if redis.call("get", KEYS[1]) == ARGV[1] then return redis.call("pexpire", KEYS[1], ARGV[2]) else return 0 end`)
+	luaRelease = radix.NewEvalScript(1, `if redis.call("get", KEYS[1]) == ARGV[1] then return redis.call("del", KEYS[1]) else return 0 end`)
+	luaPTTL    = radix.NewEvalScript(1, `if redis.call("get", KEYS[1]) == ARGV[1] then return redis.call("pttl", KEYS[1]) else return -3 end`)
 )
 
 var (
@@ -27,24 +27,15 @@ var (
 	ErrLockNotHeld = errors.New("redislock: lock not held")
 )
 
-// RedisClient is a minimal client interface.
-type RedisClient interface {
-	SetNX(key string, value interface{}, expiration time.Duration) *redis.BoolCmd
-	Eval(script string, keys []string, args ...interface{}) *redis.Cmd
-	EvalSha(sha1 string, keys []string, args ...interface{}) *redis.Cmd
-	ScriptExists(scripts ...string) *redis.BoolSliceCmd
-	ScriptLoad(script string) *redis.StringCmd
-}
-
 // Client wraps a redis client.
 type Client struct {
-	client RedisClient
+	client radix.Client
 	tmp    []byte
 	tmpMu  sync.Mutex
 }
 
 // New creates a new Client instance with a custom namespace.
-func New(client RedisClient) *Client {
+func New(client radix.Client) *Client {
 	return &Client{client: client}
 }
 
@@ -94,7 +85,12 @@ func (c *Client) Obtain(key string, ttl time.Duration, opt *Options) (*Lock, err
 }
 
 func (c *Client) obtain(key, value string, ttl time.Duration) (bool, error) {
-	return c.client.SetNX(key, value, ttl).Result()
+	result := ""
+	err := c.client.Do(radix.FlatCmd(&result, "SET", key, value, "PX", ttl.Milliseconds(), "NX"))
+	if err != nil {
+		return false, err
+	}
+	return result == "OK", nil
 }
 
 func (c *Client) randomToken() (string, error) {
@@ -121,7 +117,7 @@ type Lock struct {
 }
 
 // Obtain is a short-cut for New(...).Obtain(...).
-func Obtain(client RedisClient, key string, ttl time.Duration, opt *Options) (*Lock, error) {
+func Obtain(client radix.Client, key string, ttl time.Duration, opt *Options) (*Lock, error) {
 	return New(client).Obtain(key, ttl, opt)
 }
 
@@ -142,43 +138,40 @@ func (l *Lock) Metadata() string {
 
 // TTL returns the remaining time-to-live. Returns 0 if the lock has expired.
 func (l *Lock) TTL() (time.Duration, error) {
-	res, err := luaPTTL.Run(l.client.client, []string{l.key}, l.value).Result()
-	if err == redis.Nil {
-		return 0, nil
-	} else if err != nil {
+	var num int64
+	err := l.client.client.Do(luaPTTL.Cmd(&num, l.key, l.value))
+	if err != nil {
 		return 0, err
 	}
-
-	if num := res.(int64); num > 0 {
-		return time.Duration(num) * time.Millisecond, nil
+	if num < 0 {
+		return 0, nil
 	}
-	return 0, nil
+	return time.Duration(num) * time.Millisecond, nil
 }
 
 // Refresh extends the lock with a new TTL.
 // May return ErrNotObtained if refresh is unsuccessful.
 func (l *Lock) Refresh(ttl time.Duration, opt *Options) error {
-	ttlVal := strconv.FormatInt(int64(ttl/time.Millisecond), 10)
-	status, err := luaRefresh.Run(l.client.client, []string{l.key}, l.value, ttlVal).Result()
+	status := false
+	err := l.client.client.Do(luaRefresh.Cmd(&status, l.key, l.value, strconv.FormatInt(ttl.Milliseconds(), 10)))
 	if err != nil {
 		return err
-	} else if status == int64(1) {
-		return nil
 	}
-	return ErrNotObtained
+	if !status {
+		return ErrNotObtained
+	}
+	return nil
 }
 
 // Release manually releases the lock.
 // May return ErrLockNotHeld.
 func (l *Lock) Release() error {
-	res, err := luaRelease.Run(l.client.client, []string{l.key}, l.value).Result()
-	if err == redis.Nil {
-		return ErrLockNotHeld
-	} else if err != nil {
+	num := 0
+	err := l.client.client.Do(luaRelease.Cmd(&num, l.key, l.value))
+	if err != nil {
 		return err
 	}
-
-	if i, ok := res.(int64); !ok || i != 1 {
+	if num != 1 {
 		return ErrLockNotHeld
 	}
 	return nil
